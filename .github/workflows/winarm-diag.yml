@@ -1,0 +1,60 @@
+name: Windows ARM64 engine diagnosis
+
+on:
+  push:
+    branches: [t3/winarm-engine-diag]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Run each engine headless in each mode
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $out = Join-Path $env:RUNNER_TEMP "diag"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $page = "data:text/html,<title>ardia-diag</title><script>document.title='ardia-diag-js-'+(6*7)</script><p>hello</p>"
+          $modes = [ordered]@{
+            "sandbox" = @()
+            "no-sandbox" = @("--no-sandbox")
+            "jitless" = @("--js-flags=--jitless")
+            "no-gpu" = @("--disable-gpu")
+            "jitless-no-sandbox" = @("--js-flags=--jitless", "--no-sandbox")
+          }
+          foreach ($release in "windows-engine-20261116-4", "windows-engine-20261116-13") {
+            $dir = Join-Path $out $release
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            gh release download $release --repo $env:GITHUB_REPOSITORY --pattern ardia-engine-win-arm64.zip --dir $dir
+            tar -xf (Join-Path $dir "ardia-engine-win-arm64.zip") -C $dir
+            $exe = Join-Path $dir "chrome-win\chrome.exe"
+            foreach ($mode in $modes.Keys) {
+              $profile = Join-Path $dir "profile-$mode"
+              $log = Join-Path $dir "$mode-chrome_debug.log"
+              $args = @("--headless=new", "--user-data-dir=$profile", "--no-first-run", "--enable-logging", "--v=0", "--log-file=$log", "--dump-dom") + $modes[$mode] + @($page)
+              $watch = [Diagnostics.Stopwatch]::StartNew()
+              $p = Start-Process -FilePath $exe -ArgumentList $args -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $dir "$mode-stdout.txt") -RedirectStandardError (Join-Path $dir "$mode-stderr.txt")
+              if (-not $p.WaitForExit(60000)) { Stop-Process -Id $p.Id -Force; $code = "timeout" } else { $code = $p.ExitCode }
+              $dom = Get-Content (Join-Path $dir "$mode-stdout.txt") -Raw -ErrorAction SilentlyContinue
+              $ok = $dom -match "ardia-diag-js-42"
+              $dumps = @(Get-ChildItem -Path $profile -Recurse -Filter *.dmp -ErrorAction SilentlyContinue)
+              $crashLines = @(Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match "crash|terminat|exit_code|FATAL|Check failed|STATUS_|0xC0" } | Select-Object -First 6)
+              $line = "$release $mode`: exit $code in $([int]$watch.Elapsed.TotalSeconds) s, script ran: $ok, dumps: $($dumps.Count); $($crashLines -join ' | ')"
+              Write-Host $line
+              Add-Content (Join-Path $out "summary.txt") $line
+              foreach ($d in $dumps) { Copy-Item $d.FullName (Join-Path $dir "$mode-$($d.Name)") }
+            }
+            Remove-Item (Join-Path $dir "ardia-engine-win-arm64.zip"), (Join-Path $dir "chrome-win") -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Get-Content (Join-Path $out "summary.txt")
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: winarm-diag
+          path: ${{ runner.temp }}/diag
