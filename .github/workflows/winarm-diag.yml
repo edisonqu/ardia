@@ -5,7 +5,7 @@ on:
     branches: [t3/winarm-engine-diag]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   diagnose:
